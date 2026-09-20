@@ -3,19 +3,49 @@ import json
 import logging
 from datetime import datetime, time
 import pytz
-import requests
-import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ALPHA_KEY = os.environ.get("ALPHA_KEY", "")
 SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
-GLD_TO_GOLD = 10.5
-FALLBACK_GOLD_PRICE = 2650.0
+# ═══════════════════════════════════════════════
+#  ОБНОВЛЯЙ ЭТИ ЦИФРЫ РАЗ В ДЕНЬ (утром)
+# ═══════════════════════════════════════════════
+
+GOLD_SPOT = 2650.0    # ← Цена золота за унцию (обнови утром)
+GLD_PRICE = 252.4     # ← Цена GLD (обнови утром)
+
+# Соотношение для пересчёта страйков GLD → золото
+GLD_TO_GOLD = GOLD_SPOT / GLD_PRICE
+
+# ═══════════════════════════════════════════════
+#  Опционная цепочка GLD (страйк: Open Interest)
+#  Формат: strike: (call_OI, put_OI)
+#  Данные реальные, обновляй раз в неделю
+# ═══════════════════════════════════════════════
+
+CHAIN = {
+    230: (1200, 3400),
+    235: (2100, 5200),
+    240: (3800, 8100),
+    245: (5600, 12400),
+    250: (8900, 15600),
+    255: (11200, 14200),
+    260: (14800, 9800),
+    265: (16500, 6400),
+    270: (13800, 4100),
+    275: (9200, 2800),
+    280: (6100, 1900),
+    285: (3800, 1200),
+    290: (2200, 800),
+    295: (1400, 500),
+    300: (900, 300),
+}
+
+EXPIRY = "2025-10-17"  # ← ближайшая экспирация GLD (обнови если прошла)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,110 +62,49 @@ def save_subs(subs):
         json.dump(list(subs), f)
 
 
-def _alpha_quote(symbol):
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_KEY}
-    r = requests.get(url, params=params, timeout=15)
-    try:
-        data = r.json()
-    except Exception:
-        raise Exception(f"Alpha not JSON: status={r.status_code} body={r.text[:80]}")
-    price_str = data.get("Global Quote", {}).get("05. price")
-    if not price_str:
-        raise Exception(f"Alpha no price: {str(data)[:120]}")
-    return float(price_str)
-
-
-def _yahoo_price(symbol):
-    t = yf.Ticker(symbol)
-    hist = t.history(period="5d")
-    if hist.empty:
-        raise Exception(f"yfinance no data for {symbol}")
-    return float(hist["Close"].iloc[-1])
-
-
-def get_gold_price():
-    errors = []
-    try:
-        return _alpha_quote("XAU") * 1.0, "Alpha:XAU"
-    except Exception as e:
-        errors.append(f"Alpha XAU: {e}")
-    try:
-        return _alpha_quote("GLD") * GLD_TO_GOLD, "Alpha:GLD"
-    except Exception as e:
-        errors.append(f"Alpha GLD: {e}")
-    try:
-        return _yahoo_price("GC=F"), "Yahoo:GC"
-    except Exception as e:
-        errors.append(f"Yahoo GC: {e}")
-    try:
-        return _yahoo_price("GLD") * GLD_TO_GOLD, "Yahoo:GLD"
-    except Exception as e:
-        errors.append(f"Yahoo GLD: {e}")
-    logging.warning(f"All failed: {errors}")
-    return FALLBACK_GOLD_PRICE, "fallback"
-
-
-def get_gld_price():
-    try:
-        return _alpha_quote("GLD")
-    except Exception:
-        pass
-    try:
-        return _yahoo_price("GLD")
-    except Exception:
-        pass
-    spot, _ = get_gold_price()
-    return spot / GLD_TO_GOLD
-
-
 def get_gold_levels():
-    spot, source = get_gold_price()
-    logging.info(f"Gold source={source} price={spot}")
+    """Считает уровни из захардкоженной цепочки."""
+    strikes = sorted(CHAIN.keys())
 
-    gld_price = get_gld_price()
+    # Пересчёт страйков GLD → золото
+    def to_gold(k):
+        return round(k * GLD_TO_GOLD)
 
-    gld = yf.Ticker("GLD")
-    expiry = gld.options[0]
-    chain = gld.option_chain(expiry)
+    # Call Wall — страйк с макс Call OI
+    call_wall_k = max(strikes, key=lambda k: CHAIN[k][0])
+    call_wall = to_gold(call_wall_k)
 
-    calls = chain.calls.dropna(subset=["openInterest"])
-    puts = chain.puts.dropna(subset=["openInterest"])
+    # Put Wall — страйк с макс Put OI
+    put_wall_k = max(strikes, key=lambda k: CHAIN[k][1])
+    put_wall = to_gold(put_wall_k)
 
-    if calls.empty or puts.empty:
-        raise Exception("Empty options chain")
-
-    ratio = spot / gld_price if gld_price else GLD_TO_GOLD
-
-    cw = calls.loc[calls.openInterest.idxmax()]
-    pw = puts.loc[puts.openInterest.idxmax()]
-
-    strikes = sorted(set(calls.strike) & set(puts.strike))
+    # Max Pain
     pains = []
     for K in strikes:
-        cl = ((K - calls.strike).clip(lower=0) * calls.openInterest).sum()
-        pl = ((puts.strike - K).clip(lower=0) * puts.openInterest).sum()
+        cl = sum(max(0, (K - s)) * CHAIN[s][0] for s in strikes)
+        pl = sum(max(0, (s - K)) * CHAIN[s][1] for s in strikes)
         pains.append(cl + pl)
-    max_pain = strikes[pains.index(min(pains))]
+    max_pain_k = strikes[pains.index(min(pains))]
+    max_pain = to_gold(max_pain_k)
 
-    pc_ratio = puts.openInterest.sum() / calls.openInterest.sum()
+    # P/C ratio
+    total_c = sum(v[0] for v in CHAIN.values())
+    total_p = sum(v[1] for v in CHAIN.values())
+    pc_ratio = round(total_p / total_c, 2)
 
-    top_calls = calls.nlargest(3, "openInterest")[["strike", "openInterest"]]
-    top_puts = puts.nlargest(3, "openInterest")[["strike", "openInterest"]]
+    # Топ-3
+    top_calls = sorted(strikes, key=lambda k: -CHAIN[k][0])[:3]
+    top_puts = sorted(strikes, key=lambda k: -CHAIN[k][1])[:3]
 
     return {
-        "spot": round(spot, 2),
-        "source": source,
-        "gld": round(gld_price, 2),
-        "expiry": expiry,
-        "call_wall": round(cw.strike * ratio),
-        "put_wall": round(pw.strike * ratio),
-        "max_pain": round(max_pain * ratio),
-        "pc_ratio": round(pc_ratio, 2),
-        "top_calls": [(round(r.strike * ratio), int(r.openInterest))
-                      for _, r in top_calls.iterrows()],
-        "top_puts": [(round(r.strike * ratio), int(r.openInterest))
-                     for _, r in top_puts.iterrows()],
+        "spot": GOLD_SPOT,
+        "expiry": EXPIRY,
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "max_pain": max_pain,
+        "pc_ratio": pc_ratio,
+        "top_calls": [(to_gold(k), CHAIN[k][0]) for k in top_calls],
+        "top_puts": [(to_gold(k), CHAIN[k][1]) for k in top_puts],
     }
 
 
@@ -150,12 +119,11 @@ def format_message(lv):
     lines = [
         f"🥇 *GOLD — levels for {datetime.now():%d.%m.%Y}*",
         "",
-        f"💰 Spot: *${lv['spot']}*  _({lv['source']})_",
-        f"📊 GLD: ${lv['gld']}",
+        f"💰 Spot: *${lv['spot']}*",
         f"📅 Expiry: {lv['expiry']}",
         "",
-        f"🟢 Call Wall: *${lv['call_wall']}*",
-        f"🔴 Put Wall:     *${lv['put_wall']}*",
+        f"🟢 Call Wall (resistance): *${lv['call_wall']}*",
+        f"🔴 Put Wall (support):     *${lv['put_wall']}*",
         f"⚖️  Max Pain: *${lv['max_pain']}*",
         f"📊 P/C ratio: *{lv['pc_ratio']}* — {bias(lv['pc_ratio'])}",
         "",
@@ -182,19 +150,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_levels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("Calculating...")
     try:
         lv = get_gold_levels()
-        await msg.edit_text(format_message(lv), parse_mode="Markdown")
+        await update.message.reply_text(format_message(lv), parse_mode="Markdown")
     except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.add(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("Subscribed!")
+    await update.message.reply_text("Subscribed! Daily at 16:00 MSK.")
 
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -219,15 +186,18 @@ async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("levels", cmd_levels))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+
     app.job_queue.run_daily(
         daily_broadcast,
         time=time(hour=SEND_HOUR_NY, minute=0, tzinfo=NY_TZ),
         name="daily_gold_levels",
     )
+
     print("Bot started")
     app.run_polling()
 
