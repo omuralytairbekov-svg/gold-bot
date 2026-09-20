@@ -6,11 +6,8 @@ import pytz
 import yfinance as yf
 import pandas as pd
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ==== НАСТРОЙКИ ====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
@@ -30,16 +27,20 @@ def save_subs(subs):
 
 def get_gold_levels():
     gold = yf.Ticker("GC=F")
-    spot = gold.fast_info["last_price"]
+    gold_hist = gold.history(period="5d")
+    spot = float(gold_hist["Close"].iloc[-1])
 
     gld = yf.Ticker("GLD")
+    gld_hist = gld.history(period="5d")
+    gld_price = float(gld_hist["Close"].iloc[-1])
+
     expiry = gld.options[0]
     chain = gld.option_chain(expiry)
 
     calls = chain.calls.dropna(subset=["openInterest"])
     puts = chain.puts.dropna(subset=["openInterest"])
 
-    ratio = spot / gld.fast_info["last_price"]
+    ratio = spot / gld_price
 
     cw = calls.loc[calls.openInterest.idxmax()]
     pw = puts.loc[puts.openInterest.idxmax()]
@@ -73,72 +74,74 @@ def get_gold_levels():
 def format_message(lv):
     def bias(pcr):
         if pcr > 1.2:
-            return "🔴 медвежий"
+            return "🔴 bearish"
         if pcr < 0.7:
-            return "🟢 бычий"
-        return "⚪ нейтральный"
+            return "🟢 bullish"
+        return "⚪ neutral"
 
     lines = [
-        f"🥇 *GOLD — уровни на {datetime.now():%d.%m.%Y}*",
-        f"",
+        f"🥇 *GOLD — levels for {datetime.now():%d.%m.%Y}*",
+        "",
         f"💰 Spot: *${lv['spot']}*",
-        f"📅 Экспирация: {lv['expiry']}",
-        f"",
-        f"🟢 Call Wall (сопротивление): *${lv['call_wall']}*",
-        f"🔴 Put Wall (поддержка):      *${lv['put_wall']}*",
+        f"📅 Expiry: {lv['expiry']}",
+        "",
+        f"🟢 Call Wall (resistance): *${lv['call_wall']}*",
+        f"🔴 Put Wall (support):     *${lv['put_wall']}*",
         f"⚖️  Max Pain: *${lv['max_pain']}*",
         f"📊 P/C ratio: *{lv['pc_ratio']}* — {bias(lv['pc_ratio'])}",
-        f"",
-        f"*Топ-3 сопротивления (Call OI):*",
+        "",
+        "*Top-3 resistance (Call OI):*",
     ]
     for s, oi in lv["top_calls"]:
         lines.append(f"  • ${s}  (OI {oi:,})")
-    lines.append(f"\n*Топ-3 поддержки (Put OI):*")
+    lines.append("")
+    lines.append("*Top-3 support (Put OI):*")
     for s, oi in lv["top_puts"]:
         lines.append(f"  • ${s}  (OI {oi:,})")
-    lines.append(f"\n_Обновлено: {datetime.now():%H:%M} МСК_")
+    lines.append("")
+    lines.append(f"_Updated: {datetime.now():%H:%M}_")
     return "\n".join(lines)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я показываю опционные уровни по золоту.\n\n"
-        "/levels — уровни на сегодня\n"
-        "/subscribe — получать каждый день в 16:00 МСК\n"
-        "/unsubscribe — отписаться"
+        "Hello! I show gold options levels.\n\n"
+        "/levels — today levels\n"
+        "/subscribe — daily at 16:00 MSK\n"
+        "/unsubscribe — stop"
     )
 
 async def cmd_levels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Считаю уровни...")
+    msg = await update.message.reply_text("Calculating...")
     try:
         lv = get_gold_levels()
         await msg.edit_text(format_message(lv), parse_mode="Markdown")
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        await msg.edit_text(f"Error: {e}")
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.add(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("✅ Подписался! Уровни будут приходить каждый день в 16:00 МСК.")
+    await update.message.reply_text("Subscribed! Daily at 16:00 MSK.")
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.discard(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("❌ Отписался.")
+    await update.message.reply_text("Unsubscribed.")
 
 async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         lv = get_gold_levels()
         text = format_message(lv)
     except Exception as e:
-        text = f"❌ Ошибка получения данных: {e}"
+        text = f"Error: {e}"
 
     for chat_id in load_subs():
         try:
             await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
         except Exception as e:
-            logging.warning(f"Не отправилось {chat_id}: {e}")
+            logging.warning(f"Failed {chat_id}: {e}")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -154,7 +157,7 @@ def main():
         name="daily_gold_levels",
     )
 
-    print("✅ Бот запущен")
+    print("Bot started")
     app.run_polling()
 
 if __name__ == "__main__":
