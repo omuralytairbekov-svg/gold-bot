@@ -15,7 +15,7 @@ SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
 GLD_TO_GOLD = 10.5
-FALLBACK_GOLD_PRICE = 2650.0  # на случай, если все источники откажут
+FALLBACK_GOLD_PRICE = 2650.0
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,90 +33,68 @@ def save_subs(subs):
 
 
 def _alpha_quote(symbol):
-    """Цена через Alpha Vantage с защитой от не-JSON ответа."""
     url = "https://www.alphavantage.co/query"
     params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_KEY}
     r = requests.get(url, params=params, timeout=15)
     try:
         data = r.json()
-    except Exception as e:
-        raise Exception(f"Alpha not JSON: status={r.status_code}, body={r.text[:100]}")
-
+    except Exception:
+        raise Exception(f"Alpha not JSON: status={r.status_code} body={r.text[:80]}")
     price_str = data.get("Global Quote", {}).get("05. price")
     if not price_str:
-        raise Exception(f"Alpha no price: {str(data)[:150]}")
+        raise Exception(f"Alpha no price: {str(data)[:120]}")
     return float(price_str)
 
 
 def _yahoo_price(symbol):
-    """Цена через yfinance."""
     t = yf.Ticker(symbol)
     hist = t.history(period="5d")
     if hist.empty:
-        raise Exception(f"yfinance: no data for {symbol}")
+        raise Exception(f"yfinance no data for {symbol}")
     return float(hist["Close"].iloc[-1])
 
 
 def get_gold_price():
-    """Пробуем получить цену золота из нескольких источников."""
     errors = []
-
-    # 1. Alpha Vantage — XAU (золото)
     try:
-        return _alpha_quote("XAU"), "Alpha:XAU"
+        return _alpha_quote("XAU") * 1.0, "Alpha:XAU"
     except Exception as e:
         errors.append(f"Alpha XAU: {e}")
-
-    # 2. Alpha Vantage — GLD
     try:
-        gld = _alpha_quote("GLD")
-        return gld * GLD_TO_GOLD, "Alpha:GLD×10.5"
+        return _alpha_quote("GLD") * GLD_TO_GOLD, "Alpha:GLD"
     except Exception as e:
         errors.append(f"Alpha GLD: {e}")
-
-    # 3. yfinance — GC=F (фьючерс золота)
     try:
-        return _yahoo_price("GC=F"), "Yahoo:GC=F"
+        return _yahoo_price("GC=F"), "Yahoo:GC"
     except Exception as e:
         errors.append(f"Yahoo GC: {e}")
-
-    # 4. yfinance — GLD
     try:
-        return _yahoo_price("GLD") * GLD_TO_GOLD, "Yahoo:GLD×10.5"
+        return _yahoo_price("GLD") * GLD_TO_GOLD, "Yahoo:GLD"
     except Exception as e:
         errors.append(f"Yahoo GLD: {e}")
-
-    # 5. Fallback — фиксированная цена
-    logging.warning(f"All sources failed: {errors}")
+    logging.warning(f"All failed: {errors}")
     return FALLBACK_GOLD_PRICE, "fallback"
 
 
 def get_gld_price():
-    """Цена GLD для расчёта коэффициента опционов."""
-    # Alpha Vantage
     try:
         return _alpha_quote("GLD")
     except Exception:
         pass
-    # yfinance
     try:
         return _yahoo_price("GLD")
     except Exception:
         pass
-    # Фолбэк: spot / 10.5
     spot, _ = get_gold_price()
     return spot / GLD_TO_GOLD
 
 
 def get_gold_levels():
-    # 1. Цена золота
     spot, source = get_gold_price()
-    logging.info(f"Gold price source: {source}, value: {spot}")
+    logging.info(f"Gold source={source} price={spot}")
 
-    # 2. Цена GLD
     gld_price = get_gld_price()
 
-    # 3. Опционы GLD
     gld = yf.Ticker("GLD")
     expiry = gld.options[0]
     chain = gld.option_chain(expiry)
@@ -127,7 +105,6 @@ def get_gold_levels():
     if calls.empty or puts.empty:
         raise Exception("Empty options chain")
 
-    # коэффициент — реальное соотношение spot/gld, а не константа
     ratio = spot / gld_price if gld_price else GLD_TO_GOLD
 
     cw = calls.loc[calls.openInterest.idxmax()]
@@ -177,8 +154,8 @@ def format_message(lv):
         f"📊 GLD: ${lv['gld']}",
         f"📅 Expiry: {lv['expiry']}",
         "",
-        f"🟢 Call Wall (resistance): *${lv['call_wall']}*",
-        f"🔴 Put Wall (support):     *${lv['put_wall']}*",
+        f"🟢 Call Wall: *${lv['call_wall']}*",
+        f"🔴 Put Wall:     *${lv['put_wall']}*",
         f"⚖️  Max Pain: *${lv['max_pain']}*",
         f"📊 P/C ratio: *{lv['pc_ratio']}* — {bias(lv['pc_ratio'])}",
         "",
@@ -217,7 +194,7 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.add(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("Subscribed! Daily at 16:00 MSK.")
+    await update.message.reply_text("Subscribed!")
 
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -233,7 +210,6 @@ async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
         text = format_message(lv)
     except Exception as e:
         text = f"Error: {e}"
-
     for chat_id in load_subs():
         try:
             await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
@@ -243,18 +219,15 @@ async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("levels", cmd_levels))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
-
     app.job_queue.run_daily(
         daily_broadcast,
         time=time(hour=SEND_HOUR_NY, minute=0, tzinfo=NY_TZ),
         name="daily_gold_levels",
     )
-
     print("Bot started")
     app.run_polling()
 
