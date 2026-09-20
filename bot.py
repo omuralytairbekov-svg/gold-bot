@@ -1,6 +1,5 @@
 import os
 import json
-import io
 import logging
 from datetime import datetime, time
 import pytz
@@ -11,11 +10,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+ALPHA_KEY = os.environ.get("ALPHA_KEY", "")
 SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
-# Коэффициент пересчёта GLD → золото (доллары за унцию)
+# Коэффициент GLD -> золото
 GLD_TO_GOLD = 10.5
 
 logging.basicConfig(level=logging.INFO)
@@ -33,31 +33,44 @@ def save_subs(subs):
         json.dump(list(subs), f)
 
 
-def get_gold_levels():
-    # 1. GLD — ETF на золото, через него получаем и цену, и опционы
-    gld = yf.Ticker("GLD")
+def _alpha_quote(symbol):
+    """Цена через Alpha Vantage."""
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "GLOBAL_QUOTE",
+        "symbol": symbol,
+        "apikey": ALPHA_KEY,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    data = r.json()
+    quote = data.get("Global Quote", {})
+    price_str = quote.get("05. price")
+    if not price_str:
+        raise Exception(f"Alpha Vantage: no price for {symbol}. Response: {data}")
+    return float(price_str)
 
-    # 2. Пытаемся взять свежую цену GLD через yfinance
+
+def get_gold_levels():
+    # 1. Пробуем взять цену GLD через Alpha Vantage
     gld_price = None
     try:
-        hist = gld.history(period="5d")
-        if not hist.empty:
-            gld_price = float(hist["Close"].iloc[-1])
+        gld_price = _alpha_quote("GLD")
     except Exception as e:
-        logging.warning(f"yfinance history failed: {e}")
+        logging.warning(f"Alpha GLD failed: {e}")
 
-    # 3. Если yfinance не отдал — берём через Stooq
+    # 2. Если Alpha Vantage не сработал — берём через yfinance
     if gld_price is None:
-        url = "https://stooq.com/q/l/?s=gld.us&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        gld_price = float(df["Close"].iloc[0])
+        gld = yf.Ticker("GLD")
+        hist = gld.history(period="5d")
+        if hist.empty:
+            raise Exception("Cannot fetch GLD price from any source")
+        gld_price = float(hist["Close"].iloc[-1])
 
-    # 4. Цена золота за унцию (приближённо)
+    # 3. Цена золота за унцию
     spot = gld_price * GLD_TO_GOLD
 
-    # 5. Опционная цепочка GLD
+    # 4. Опционы GLD через yfinance
+    gld = yf.Ticker("GLD")
     expiry = gld.options[0]
     chain = gld.option_chain(expiry)
 
@@ -69,11 +82,9 @@ def get_gold_levels():
 
     ratio = GLD_TO_GOLD
 
-    # 6. Call Wall и Put Wall
     cw = calls.loc[calls.openInterest.idxmax()]
     pw = puts.loc[puts.openInterest.idxmax()]
 
-    # 7. Max Pain
     strikes = sorted(set(calls.strike) & set(puts.strike))
     pains = []
     for K in strikes:
@@ -82,10 +93,8 @@ def get_gold_levels():
         pains.append(cl + pl)
     max_pain = strikes[pains.index(min(pains))]
 
-    # 8. P/C ratio
     pc_ratio = puts.openInterest.sum() / calls.openInterest.sum()
 
-    # 9. Топ-3 страйка
     top_calls = calls.nlargest(3, "openInterest")[["strike", "openInterest"]]
     top_puts = puts.nlargest(3, "openInterest")[["strike", "openInterest"]]
 
