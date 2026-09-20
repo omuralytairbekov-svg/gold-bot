@@ -15,6 +15,9 @@ SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
+# Коэффициент пересчёта GLD → золото (доллары за унцию)
+GLD_TO_GOLD = 10.5
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -30,34 +33,31 @@ def save_subs(subs):
         json.dump(list(subs), f)
 
 
-def _stooq_price(symbol):
-    """Цена через Stooq. symbol: xauusd, gld.us"""
-    url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
-    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    return float(df["Close"].iloc[0])
-
-
 def get_gold_levels():
-    # 1. Цена золота через Stooq
-    spot = _stooq_price("xauusd")
-
-    # 2. Цена GLD через Stooq
-    try:
-        gld_price = _stooq_price("gld.us")
-    except Exception:
-        gld_price = None
-
-    # 3. Опционная цепочка GLD через yfinance
+    # 1. GLD — ETF на золото, через него получаем и цену, и опционы
     gld = yf.Ticker("GLD")
-    if gld_price is None:
-        # fallback — цена из истории yfinance
-        hist = gld.history(period="5d")
-        if hist.empty:
-            raise Exception("Cannot fetch GLD price")
-        gld_price = float(hist["Close"].iloc[-1])
 
+    # 2. Пытаемся взять свежую цену GLD через yfinance
+    gld_price = None
+    try:
+        hist = gld.history(period="5d")
+        if not hist.empty:
+            gld_price = float(hist["Close"].iloc[-1])
+    except Exception as e:
+        logging.warning(f"yfinance history failed: {e}")
+
+    # 3. Если yfinance не отдал — берём через Stooq
+    if gld_price is None:
+        url = "https://stooq.com/q/l/?s=gld.us&f=sd2t2ohlcv&h&e=csv"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        gld_price = float(df["Close"].iloc[0])
+
+    # 4. Цена золота за унцию (приближённо)
+    spot = gld_price * GLD_TO_GOLD
+
+    # 5. Опционная цепочка GLD
     expiry = gld.options[0]
     chain = gld.option_chain(expiry)
 
@@ -67,11 +67,13 @@ def get_gold_levels():
     if calls.empty or puts.empty:
         raise Exception("Empty options chain")
 
-    ratio = spot / gld_price
+    ratio = GLD_TO_GOLD
 
+    # 6. Call Wall и Put Wall
     cw = calls.loc[calls.openInterest.idxmax()]
     pw = puts.loc[puts.openInterest.idxmax()]
 
+    # 7. Max Pain
     strikes = sorted(set(calls.strike) & set(puts.strike))
     pains = []
     for K in strikes:
@@ -80,8 +82,10 @@ def get_gold_levels():
         pains.append(cl + pl)
     max_pain = strikes[pains.index(min(pains))]
 
+    # 8. P/C ratio
     pc_ratio = puts.openInterest.sum() / calls.openInterest.sum()
 
+    # 9. Топ-3 страйка
     top_calls = calls.nlargest(3, "openInterest")[["strike", "openInterest"]]
     top_puts = puts.nlargest(3, "openInterest")[["strike", "openInterest"]]
 
