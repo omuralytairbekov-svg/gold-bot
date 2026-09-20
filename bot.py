@@ -1,10 +1,12 @@
 import os
 import json
+import io
 import logging
 from datetime import datetime, time
 import pytz
 import requests
 import pandas as pd
+import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -15,68 +17,50 @@ NY_TZ = pytz.timezone("America/New_York")
 
 logging.basicConfig(level=logging.INFO)
 
+
 def load_subs():
     if os.path.exists(SUBSCRIBERS_FILE):
         with open(SUBSCRIBERS_FILE) as f:
             return set(json.load(f))
     return set()
 
+
 def save_subs(subs):
     with open(SUBSCRIBERS_FILE, "w") as f:
         json.dump(list(subs), f)
 
-def get_gold_price():
-    """Цена золота через Stooq (не блокирует серверы)."""
-    try:
-        # Stooq: XAUUSD — золото спот
-        url = "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        df = pd.read_csv(pd.compat.StringIO(r.text)) if False else pd.read_csv(
-            __import__("io").StringIO(r.text)
-        )
-        return float(df["Close"].iloc[0])
-    except Exception as e:
-        logging.error(f"Stooq error: {e}")
-        # Фолбэк — Yahoo
-        try:
-            import yfinance as yf
-            hist = yf.Ticker("GC=F").history(period="5d")
-            return float(hist["Close"].iloc[-1])
-        except Exception as e2:
-            logging.error(f"Yahoo fallback error: {e2}")
-            raise
 
-def get_gld_price():
-    """Цена GLD через Stooq."""
-    try:
-        url = "https://stooq.com/q/l/?s=gld.us&f=sd2t2ohlcv&h&e=csv"
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        import io
-        df = pd.read_csv(io.StringIO(r.text))
-        return float(df["Close"].iloc[0])
-    except Exception as e:
-        logging.error(f"GLD Stooq error: {e}")
-        return None
+def _stooq_price(symbol):
+    """Цена через Stooq. symbol: xauusd, gld.us"""
+    url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    return float(df["Close"].iloc[0])
+
 
 def get_gold_levels():
-    # Цена золота
-    spot = get_gold_price()
+    # 1. Цена золота через Stooq
+    spot = _stooq_price("xauusd")
 
-    # Пытаемся получить опционы через yfinance (GLD)
-    import yfinance as yf
-    gld = yf.Ticker("GLD")
-    gld_price = get_gld_price() or gld.info.get("regularMarketPrice")
-
-    if not gld_price:
-        raise Exception("Cannot fetch GLD price")
-
-    # Экспирации
+    # 2. Цена GLD через Stooq
     try:
-        expiry = gld.options[0]
-    except Exception as e:
-        raise Exception(f"No GLD options: {e}")
+        gld_price = _stooq_price("gld.us")
+    except Exception:
+        gld_price = None
 
+    # 3. Опционная цепочка GLD через yfinance
+    gld = yf.Ticker("GLD")
+    if gld_price is None:
+        # fallback — цена из истории yfinance
+        hist = gld.history(period="5d")
+        if hist.empty:
+            raise Exception("Cannot fetch GLD price")
+        gld_price = float(hist["Close"].iloc[-1])
+
+    expiry = gld.options[0]
     chain = gld.option_chain(expiry)
+
     calls = chain.calls.dropna(subset=["openInterest"])
     puts = chain.puts.dropna(subset=["openInterest"])
 
@@ -89,5 +73,127 @@ def get_gold_levels():
     pw = puts.loc[puts.openInterest.idxmax()]
 
     strikes = sorted(set(calls.strike) & set(puts.strike))
-    if not strikes:
-        raise Exception
+    pains = []
+    for K in strikes:
+        cl = ((K - calls.strike).clip(lower=0) * calls.openInterest).sum()
+        pl = ((puts.strike - K).clip(lower=0) * puts.openInterest).sum()
+        pains.append(cl + pl)
+    max_pain = strikes[pains.index(min(pains))]
+
+    pc_ratio = puts.openInterest.sum() / calls.openInterest.sum()
+
+    top_calls = calls.nlargest(3, "openInterest")[["strike", "openInterest"]]
+    top_puts = puts.nlargest(3, "openInterest")[["strike", "openInterest"]]
+
+    return {
+        "spot": round(spot, 2),
+        "expiry": expiry,
+        "call_wall": round(cw.strike * ratio),
+        "put_wall": round(pw.strike * ratio),
+        "max_pain": round(max_pain * ratio),
+        "pc_ratio": round(pc_ratio, 2),
+        "top_calls": [(round(r.strike * ratio), int(r.openInterest))
+                      for _, r in top_calls.iterrows()],
+        "top_puts": [(round(r.strike * ratio), int(r.openInterest))
+                     for _, r in top_puts.iterrows()],
+    }
+
+
+def format_message(lv):
+    def bias(pcr):
+        if pcr > 1.2:
+            return "🔴 bearish"
+        if pcr < 0.7:
+            return "🟢 bullish"
+        return "⚪ neutral"
+
+    lines = [
+        f"🥇 *GOLD — levels for {datetime.now():%d.%m.%Y}*",
+        "",
+        f"💰 Spot: *${lv['spot']}*",
+        f"📅 Expiry: {lv['expiry']}",
+        "",
+        f"🟢 Call Wall (resistance): *${lv['call_wall']}*",
+        f"🔴 Put Wall (support):     *${lv['put_wall']}*",
+        f"⚖️  Max Pain: *${lv['max_pain']}*",
+        f"📊 P/C ratio: *{lv['pc_ratio']}* — {bias(lv['pc_ratio'])}",
+        "",
+        "*Top-3 resistance (Call OI):*",
+    ]
+    for s, oi in lv["top_calls"]:
+        lines.append(f"  • ${s}  (OI {oi:,})")
+    lines.append("")
+    lines.append("*Top-3 support (Put OI):*")
+    for s, oi in lv["top_puts"]:
+        lines.append(f"  • ${s}  (OI {oi:,})")
+    lines.append("")
+    lines.append(f"_Updated: {datetime.now():%H:%M}_")
+    return "\n".join(lines)
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello! I show gold options levels.\n\n"
+        "/levels — today levels\n"
+        "/subscribe — daily at 16:00 MSK\n"
+        "/unsubscribe — stop"
+    )
+
+
+async def cmd_levels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("Calculating...")
+    try:
+        lv = get_gold_levels()
+        await msg.edit_text(format_message(lv), parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"Error: {e}")
+
+
+async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    subs = load_subs()
+    subs.add(update.effective_chat.id)
+    save_subs(subs)
+    await update.message.reply_text("Subscribed! Daily at 16:00 MSK.")
+
+
+async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    subs = load_subs()
+    subs.discard(update.effective_chat.id)
+    save_subs(subs)
+    await update.message.reply_text("Unsubscribed.")
+
+
+async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        lv = get_gold_levels()
+        text = format_message(lv)
+    except Exception as e:
+        text = f"Error: {e}"
+
+    for chat_id in load_subs():
+        try:
+            await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"Failed {chat_id}: {e}")
+
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("levels", cmd_levels))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+
+    app.job_queue.run_daily(
+        daily_broadcast,
+        time=time(hour=SEND_HOUR_NY, minute=0, tzinfo=NY_TZ),
+        name="daily_gold_levels",
+    )
+
+    print("Bot started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
