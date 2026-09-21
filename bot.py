@@ -8,14 +8,55 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
-# Фолбэк цена золота (если металл-API не ответит)
-FALLBACK_GOLD = 4372.0
-GLD_TO_GOLD = 10.90
+# ═══════════════════════════════════════════════════════
+#  НАСТРОЙКИ — ОБНОВЛЯЙ РАЗ В ДЕНЬ (утром, 30 секунд)
+# ═══════════════════════════════════════════════════════
+
+FALLBACK_GOLD = 4372.0    # ← Цена золота (обнови утром)
+GLD_TO_GOLD = 10.90       # ← Коэффициент GLD → золото
+EXPIRY = "2026-09-21 (0DTE)"  # ← Дата экспирации
+
+# ═══════════════════════════════════════════════════════
+#  ОПЦИОННАЯ ЦЕПОЧКА GLD — ОБНОВЛЯЙ 1-2 РАЗА В ДЕНЬ
+#  Источник: barchart.com/stocks/quotes/GLD/options
+#  Формат: strike: (Call OI, Put OI)
+# ═══════════════════════════════════════════════════════
+
+CHAIN = {
+    390: (42,   96),
+    391: (43,   88),
+    392: (40,   88),
+    393: (40,   95),
+    394: (297,  231),
+    395: (75,   161),
+    396: (66,   717),    # ← Put Wall
+    397: (119,  257),
+    398: (85,   167),
+    399: (105,  132),
+    400: (70,   485),
+    401: (396,  61),
+    402: (165,  99),
+    403: (73,   39),
+    404: (100,  48),
+    405: (90,   47),
+    406: (310,  8),
+    407: (128,  11),
+    408: (72,   50),
+    409: (90,   10),
+    410: (82,   16),
+    411: (718,  12),     # ← Call Wall 2
+    412: (76,   2),
+    413: (96,   2),
+    414: (184,  4),
+    415: (96,   1),
+    416: (865,  3),      # ← Call Wall
+    417: (67,   0),
+    418: (43,   0),
+}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,7 +74,7 @@ def save_subs(subs):
 
 
 def get_gold_price():
-    """Цена золота через metals.live, с фолбэком."""
+    """Пробуем metals.live, при неудаче — fallback."""
     try:
         r = requests.get(
             "https://api.metals.live/v1/spot/gold",
@@ -51,85 +92,40 @@ def get_gold_price():
     return FALLBACK_GOLD, "fallback"
 
 
-def fetch_option_chain():
-    """Получает опционную цепочку GLD через Finnhub."""
-    url = "https://finnhub.io/api/v1/stock/option-chain"
-    params = {"symbol": "GLD", "token": FINNHUB_KEY}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-
-    if "data" not in data or not data["data"]:
-        raise Exception(f"Finnhub: no data. Response: {str(data)[:200]}")
-
-    # Берём ближайшую экспирацию
-    expirations = sorted([d["expirationDate"] for d in data["data"]])
-    nearest = expirations[0]
-
-    # Находим нужный блок
-    block = next(d for d in data["data"] if d["expirationDate"] == nearest)
-    calls = block["options"]["CALL"]
-    puts = block["options"]["PUT"]
-
-    # Сводим OI по страйкам
-    chain = {}  # strike: [call_oi, put_oi]
-    for c in calls:
-        k = float(c["strike"])
-        oi = int(c.get("openInterest") or 0)
-        chain.setdefault(k, [0, 0])[0] = oi
-    for p in puts:
-        k = float(p["strike"])
-        oi = int(p.get("openInterest") or 0)
-        chain.setdefault(k, [0, 0])[1] = oi
-
-    return chain, nearest
-
-
 def get_gold_levels():
     spot, source = get_gold_price()
     logging.info(f"Gold source={source} spot={spot}")
 
-    chain, expiry = fetch_option_chain()
-
-    # Отбрасываем страйки с нулевым OI
-    chain = {k: v for k, v in chain.items() if v[0] > 0 or v[1] > 0}
-    if not chain:
-        raise Exception("All strikes have zero OI")
-
-    strikes = sorted(chain.keys())
+    strikes = sorted(CHAIN.keys())
     ratio = GLD_TO_GOLD
 
-    # Call Wall / Put Wall
-    call_wall_k = max(strikes, key=lambda k: chain[k][0])
-    put_wall_k = max(strikes, key=lambda k: chain[k][1])
+    call_wall_k = max(strikes, key=lambda k: CHAIN[k][0])
+    put_wall_k = max(strikes, key=lambda k: CHAIN[k][1])
 
-    # Top-3
-    top_calls = sorted(strikes, key=lambda k: -chain[k][0])[:3]
-    top_puts = sorted(strikes, key=lambda k: -chain[k][1])[:3]
+    top_calls = sorted(strikes, key=lambda k: -CHAIN[k][0])[:3]
+    top_puts = sorted(strikes, key=lambda k: -CHAIN[k][1])[:3]
 
-    # Max Pain
     pains = []
     for K in strikes:
-        cl = sum(max(0, (K - s)) * chain[s][0] for s in strikes)
-        pl = sum(max(0, (s - K)) * chain[s][1] for s in strikes)
+        cl = sum(max(0, (K - s)) * CHAIN[s][0] for s in strikes)
+        pl = sum(max(0, (s - K)) * CHAIN[s][1] for s in strikes)
         pains.append(cl + pl)
     max_pain_k = strikes[pains.index(min(pains))]
 
-    # P/C ratio
-    total_c = sum(v[0] for v in chain.values())
-    total_p = sum(v[1] for v in chain.values())
+    total_c = sum(v[0] for v in CHAIN.values())
+    total_p = sum(v[1] for v in CHAIN.values())
     pc_ratio = round(total_p / total_c, 2) if total_c else 0
 
     return {
         "spot": round(spot, 2),
         "source": source,
-        "expiry": expiry,
+        "expiry": EXPIRY,
         "call_wall": round(call_wall_k * ratio),
         "put_wall": round(put_wall_k * ratio),
         "max_pain": round(max_pain_k * ratio),
         "pc_ratio": pc_ratio,
-        "top_calls": [(round(k * ratio), chain[k][0]) for k in top_calls],
-        "top_puts": [(round(k * ratio), chain[k][1]) for k in top_puts],
+        "top_calls": [(round(k * ratio), CHAIN[k][0]) for k in top_calls],
+        "top_puts": [(round(k * ratio), CHAIN[k][1]) for k in top_puts],
     }
 
 
