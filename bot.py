@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import datetime, time
 import pytz
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -11,72 +12,118 @@ SUBSCRIBERS_FILE = "subscribers.json"
 SEND_HOUR_NY = 9
 NY_TZ = pytz.timezone("America/New_York")
 
-# ═══════════════════════════════════════════════
-#  ОБНОВЛЯЙ ЭТИ ЦИФРЫ РАЗ В ДЕНЬ (утром)
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#  НАСТРОЙКИ — ОБНОВЛЯЙ РАЗ В ДЕНЬ (или раз в неделю)
+# ═══════════════════════════════════════════════════════
 
-GOLD_SPOT = 2650.0    # ← Цена золота за унцию (обнови утром)
-GLD_PRICE = 252.4     # ← Цена GLD (обнови утром)
+# Фолбэк цена золота (если metals.live не ответит)
+FALLBACK_GOLD = 4372.0
 
-# Соотношение для пересчёта страйков GLD → золото
-GLD_TO_GOLD = GOLD_SPOT / GLD_PRICE
+# Коэффициент GLD → золото (обнови если сильно меняется)
+GLD_TO_GOLD = 10.90
 
-# ═══════════════════════════════════════════════
-#  Опционная цепочка GLD (страйк: Open Interest)
-#  Формат: strike: (call_OI, put_OI)
-#  Данные реальные, обновляй раз в неделю
-# ═══════════════════════════════════════════════
+# Экспирация (для отображения)
+EXPIRY = "2026-09-21 (0DTE)"
+
+# ═══════════════════════════════════════════════════════
+#  ОПЦИОННАЯ ЦЕПОЧКА GLD — ОБНОВЛЯЙ 1-2 РАЗА В ДЕНЬ
+#  Формат: strike: (Call OI, Put OI)
+#  Источник: barchart.com/stocks/quotes/GLD/options
+# ═══════════════════════════════════════════════════════
 
 CHAIN = {
-    230: (1200, 3400),
-    235: (2100, 5200),
-    240: (3800, 8100),
-    245: (5600, 12400),
-    250: (8900, 15600),
-    255: (11200, 14200),
-    260: (14800, 9800),
-    265: (16500, 6400),
-    270: (13800, 4100),
-    275: (9200, 2800),
-    280: (6100, 1900),
-    285: (3800, 1200),
-    290: (2200, 800),
-    295: (1400, 500),
-    300: (900, 300),
+    # Страйк: (Call OI, Put OI) — данные 21.09.2026, 0DTE
+    390: (42,   96),
+    391: (43,   88),
+    392: (40,   88),
+    393: (40,   95),
+    394: (297,  231),
+    395: (75,   161),
+    396: (66,   717),    # ← Put Wall (максимум Put OI)
+    397: (119,  257),
+    398: (85,   167),
+    399: (105,  132),
+    400: (70,   485),
+    401: (396,  61),
+    402: (165,  99),
+    403: (73,   39),
+    404: (100,  48),
+    405: (90,   47),
+    406: (310,  8),      # ← сопротивление
+    407: (128,  11),
+    408: (72,   50),
+    409: (90,   10),
+    410: (82,   16),
+    411: (718,  12),     # ← Call Wall 2
+    412: (76,   2),
+    413: (96,   2),
+    414: (184,  4),
+    415: (96,   1),
+    416: (865,  3),      # ← Call Wall (максимум Call OI)
+    417: (67,   0),
+    418: (43,   0),
 }
-
-EXPIRY = "2025-10-17"  # ← ближайшая экспирация GLD (обнови если прошла)
 
 logging.basicConfig(level=logging.INFO)
 
 
-def load_subs():
-    if os.path.exists(SUBSCRIBERS_FILE):
-        with open(SUBSCRIBERS_FILE) as f:
-            return set(json.load(f))
-    return set()
+# ═══════════════════════════════════════════════════════
+#  АВТОЦЕНА ЗОЛОТА — metals.live (без блокировок)
+# ═══════════════════════════════════════════════════════
+
+def get_gold_price():
+    """Цена золота через metals.live (надёжный, без API-ключа)."""
+    try:
+        r = requests.get(
+            "https://api.metals.live/v1/spot/gold",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        # формат: [{"gold": 4372.5}]
+        if isinstance(data, list) and data:
+            price = data[0].get("gold")
+            if price:
+                return float(price), "metals.live"
+    except Exception as e:
+        logging.warning(f"metals.live failed: {e}")
+
+    # Фолбэк — Фикс
+    return FALLBACK_GOLD, "fallback"
 
 
-def save_subs(subs):
-    with open(SUBSCRIBERS_FILE, "w") as f:
-        json.dump(list(subs), f)
-
+# ═══════════════════════════════════════════════════════
+#  РАСЧЁТ УРОВНЕЙ
+# ═══════════════════════════════════════════════════════
 
 def get_gold_levels():
-    """Считает уровни из захардкоженной цепочки."""
+    spot, source = get_gold_price()
+    logging.info(f"Gold source={source}, spot={spot}")
+
     strikes = sorted(CHAIN.keys())
 
-    # Пересчёт страйков GLD → золото
-    def to_gold(k):
-        return round(k * GLD_TO_GOLD)
+    # Коэффициент GLD→золото (динамический)
+    # GLD ≈ spot / 10.9, значит соотношение = 10.9
+    ratio = GLD_TO_GOLD
 
     # Call Wall — страйк с макс Call OI
     call_wall_k = max(strikes, key=lambda k: CHAIN[k][0])
-    call_wall = to_gold(call_wall_k)
+    call_wall = round(call_wall_k * ratio)
 
     # Put Wall — страйк с макс Put OI
     put_wall_k = max(strikes, key=lambda k: CHAIN[k][1])
-    put_wall = to_gold(put_wall_k)
+    put_wall = round(put_wall_k * ratio)
+
+    # Топ-2 уровней (резистенс/поддержка возле цены)
+    def second_call_wall():
+        # Второй по величине Call OI
+        sorted_calls = sorted(strikes, key=lambda k: -CHAIN[k][0])
+        return round(sorted_calls[1] * ratio)
+
+    def second_put_wall():
+        sorted_puts = sorted(strikes, key=lambda k: -CHAIN[k][1])
+        return round(sorted_puts[1] * ratio)
 
     # Max Pain
     pains = []
@@ -85,28 +132,35 @@ def get_gold_levels():
         pl = sum(max(0, (s - K)) * CHAIN[s][1] for s in strikes)
         pains.append(cl + pl)
     max_pain_k = strikes[pains.index(min(pains))]
-    max_pain = to_gold(max_pain_k)
+    max_pain = round(max_pain_k * ratio)
 
     # P/C ratio
     total_c = sum(v[0] for v in CHAIN.values())
     total_p = sum(v[1] for v in CHAIN.values())
-    pc_ratio = round(total_p / total_c, 2)
+    pc_ratio = round(total_p / total_c, 2) if total_c else 0
 
-    # Топ-3
+    # Top-3
     top_calls = sorted(strikes, key=lambda k: -CHAIN[k][0])[:3]
     top_puts = sorted(strikes, key=lambda k: -CHAIN[k][1])[:3]
 
     return {
-        "spot": GOLD_SPOT,
+        "spot": round(spot, 2),
+        "source": source,
         "expiry": EXPIRY,
         "call_wall": call_wall,
+        "resistance": second_call_wall(),
         "put_wall": put_wall,
+        "support": second_put_wall(),
         "max_pain": max_pain,
         "pc_ratio": pc_ratio,
-        "top_calls": [(to_gold(k), CHAIN[k][0]) for k in top_calls],
-        "top_puts": [(to_gold(k), CHAIN[k][1]) for k in top_puts],
+        "top_calls": [(round(k * ratio), CHAIN[k][0]) for k in top_calls],
+        "top_puts": [(round(k * ratio), CHAIN[k][1]) for k in top_puts],
     }
 
+
+# ═══════════════════════════════════════════════════════
+#  ФОРМАТИРОВАНИЕ СООБЩЕНИЯ
+# ═══════════════════════════════════════════════════════
 
 def format_message(lv):
     def bias(pcr):
@@ -117,42 +171,55 @@ def format_message(lv):
         return "⚪ neutral"
 
     lines = [
-        f"🥇 *GOLD — levels for {datetime.now():%d.%m.%Y}*",
+        f"🥇 *GOLD / XAUUSD — {datetime.now():%d.%m.%Y}*",
         "",
         f"💰 Spot: *${lv['spot']}*",
         f"📅 Expiry: {lv['expiry']}",
         "",
-        f"🟢 Call Wall (resistance): *${lv['call_wall']}*",
-        f"🔴 Put Wall (support):     *${lv['put_wall']}*",
-        f"⚖️  Max Pain: *${lv['max_pain']}*",
+        f"🟢 Call Wall: *${lv['call_wall']}*",
+        f"🟢 Resistance: *${lv['resistance']}*",
+        f"⚪ Max Pain: *${lv['max_pain']}*",
+        f"🔴 Put Wall: *${lv['put_wall']}*",
+        f"🔴 Support: *${lv['support']}*",
+        "",
         f"📊 P/C ratio: *{lv['pc_ratio']}* — {bias(lv['pc_ratio'])}",
         "",
-        "*Top-3 resistance (Call OI):*",
+        "*Топ-3 сопротивления (Call OI):*",
     ]
     for s, oi in lv["top_calls"]:
         lines.append(f"  • ${s}  (OI {oi:,})")
     lines.append("")
-    lines.append("*Top-3 support (Put OI):*")
+    lines.append("*Топ-3 поддержки (Put OI):*")
     for s, oi in lv["top_puts"]:
         lines.append(f"  • ${s}  (OI {oi:,})")
     lines.append("")
+    lines.append(f"_Источник цены: {lv['source']}_")
     lines.append(f"_Updated: {datetime.now():%H:%M}_")
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════
+#  КОМАНДЫ БОТА
+# ═══════════════════════════════════════════════════════
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello! I show gold options levels.\n\n"
-        "/levels — today levels\n"
-        "/subscribe — daily at 16:00 MSK\n"
-        "/unsubscribe — stop"
+        "🥇 *Gold Levels Bot*\n\n"
+        "Показываю опционные уровни по золоту (XAUUSD).\n\n"
+        "/levels — уровни на сегодня\n"
+        "/subscribe — ежедневная рассылка в 16:00 МСК\n"
+        "/unsubscribe — отписаться",
+        parse_mode="Markdown"
     )
 
 
 async def cmd_levels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         lv = get_gold_levels()
-        await update.message.reply_text(format_message(lv), parse_mode="Markdown")
+        await update.message.reply_text(
+            format_message(lv),
+            parse_mode="Markdown"
+        )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -161,14 +228,14 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.add(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("Subscribed! Daily at 16:00 MSK.")
+    await update.message.reply_text("✅ Подписан! Уровни будут приходить ежедневно в 16:00 МСК.")
 
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
     subs.discard(update.effective_chat.id)
     save_subs(subs)
-    await update.message.reply_text("Unsubscribed.")
+    await update.message.reply_text("❌ Отписан.")
 
 
 async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
@@ -183,6 +250,26 @@ async def daily_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.warning(f"Failed {chat_id}: {e}")
 
+
+# ═══════════════════════════════════════════════════════
+#  ХРАНЕНИЕ ПОДПИСЧИКОВ
+# ═══════════════════════════════════════════════════════
+
+def load_subs():
+    if os.path.exists(SUBSCRIBERS_FILE):
+        with open(SUBSCRIBERS_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_subs(subs):
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(list(subs), f)
+
+
+# ═══════════════════════════════════════════════════════
+#  ЗАПУСК
+# ═══════════════════════════════════════════════════════
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
